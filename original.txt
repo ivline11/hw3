@@ -1,1 +1,1 @@
-Hello, this is a test message for encryption and decryption!
+This is a test message that will be encrypted.

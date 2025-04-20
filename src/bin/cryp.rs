@@ -1,171 +1,129 @@
-use std::env;
-use std::fs;
-use std::process;
+// src/bin/cryp.rs
+
 use openssl::symm::{Cipher, Crypter, Mode};
+use openssl::base64::{encode_block, decode_block};
+use sha2::{Digest, Sha256};
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use openssl::rand::rand_bytes;
+use std::{env, fs, str};
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn encrypt_data(cipher: Cipher, key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, openssl::error::ErrorStack> {
-    let mut crypter = Crypter::new(cipher, Mode::Encrypt, key, Some(iv))?;
+fn encrypt(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher = Cipher::aes_256_cbc();
+    let mut c = Crypter::new(cipher, Mode::Encrypt, key, Some(iv))
+        .map_err(|e| e.to_string())?;
     let mut out = vec![0; data.len() + cipher.block_size()];
-    let count = crypter.update(data, &mut out)?;
-    let rest = crypter.finalize(&mut out[count..])?;
-    out.truncate(count + rest);
+    let cnt = c.update(data, &mut out).map_err(|e| e.to_string())?;
+    let rest = c.finalize(&mut out[cnt..]).map_err(|e| e.to_string())?;
+    out.truncate(cnt + rest);
     Ok(out)
 }
 
-fn decrypt_data(cipher: Cipher, key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, openssl::error::ErrorStack> {
-    let mut crypter = Crypter::new(cipher, Mode::Decrypt, key, Some(iv))?;
+fn decrypt(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher = Cipher::aes_256_cbc();
+    let mut c = Crypter::new(cipher, Mode::Decrypt, key, Some(iv))
+        .map_err(|e| e.to_string())?;
     let mut out = vec![0; data.len() + cipher.block_size()];
-    let count = crypter.update(data, &mut out)?;
-    let rest = crypter.finalize(&mut out[count..])?;
-    out.truncate(count + rest);
+    let cnt = c.update(data, &mut out).map_err(|e| e.to_string())?;
+    let rest = c.finalize(&mut out[cnt..]).map_err(|e| e.to_string())?;
+    out.truncate(cnt + rest);
     Ok(out)
+}
+
+fn hmac_tag(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key error");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn verify_tag(key: &[u8], data: &[u8], tag: &[u8]) -> bool {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key error");
+    mac.update(data);
+    mac.verify_slice(tag).is_ok()
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    
-    if args.len() != 9 {
-        println!("ERROR");
-        process::exit(2);
+    if args.len() < 9 {
+        eprintln!("ERROR");
+        std::process::exit(2);
     }
+    let mode = args[1].as_str(); // "enc" or "dec"
 
-    let mode = &args[1];
-    let mut key_file = "";
-    let mut input_file = "";
-    let mut output_file = "";
-    let mut tag_file = "";
-
-    // Parse arguments
+    // flag 기반 파싱
+    let mut key_path = None;
+    let mut in_path  = None;
+    let mut out_path = None;
+    let mut tag_path = None;
     let mut i = 2;
-    while i < args.len() {
+    while i + 1 < args.len() {
         match args[i].as_str() {
-            "-key" => key_file = &args[i + 1],
-            "-in" => input_file = &args[i + 1],
-            "-out" => output_file = &args[i + 1],
-            "-tag" => tag_file = &args[i + 1],
+            "-key" => { key_path = Some(args[i+1].as_str()); }
+            "-in"  => { in_path  = Some(args[i+1].as_str()); }
+            "-out" => { out_path = Some(args[i+1].as_str()); }
+            "-tag" => { tag_path = Some(args[i+1].as_str()); }
             _ => {
-                println!("ERROR");
-                process::exit(2);
+                eprintln!("ERROR");
+                std::process::exit(2);
             }
         }
         i += 2;
     }
+    let key_path = key_path.unwrap_or_else(|| { eprintln!("ERROR"); std::process::exit(2) });
+    let in_path  = in_path .unwrap_or_else(|| { eprintln!("ERROR"); std::process::exit(2) });
+    let out_path = out_path.unwrap_or_else(|| { eprintln!("ERROR"); std::process::exit(2) });
+    let tag_path = tag_path.unwrap_or_else(|| { eprintln!("ERROR"); std::process::exit(2) });
 
-    // Read key
-    let key = match fs::read_to_string(key_file) {
-        Ok(k) => k.trim().as_bytes().to_vec(),
-        Err(_) => {
-            println!("ERROR");
-            process::exit(2);
-        }
-    };
+    // shared.key 파일 → SHA256 해시 → AES 키(32B), IV(16B), HMAC 키(32B)
+    let key_file = fs::read(key_path).unwrap_or_else(|_| { eprintln!("ERROR"); std::process::exit(2) });
+    let key_hash = Sha256::digest(&key_file);
+    let aes_key = &key_hash[..];      // 32 bytes
+    let iv      = &key_hash[..16];    // first 16 bytes
 
-    // Key must be exactly 32 bytes for AES-256
-    let mut real_key = [0u8; 32];
-    let key_bytes = key.as_slice();
-    let len = std::cmp::min(key_bytes.len(), 32);
-    real_key[..len].copy_from_slice(&key_bytes[..len]);
-
-    // Read input file
-    let input_data = match fs::read(input_file) {
-        Ok(data) => data,
-        Err(_) => {
-            println!("ERROR");
-            process::exit(2);
-        }
-    };
-
-    match mode.as_str() {
+    match mode {
         "enc" => {
-            // Generate random IV
-            let mut iv = vec![0u8; 16];
-            if let Err(_) = rand_bytes(&mut iv) {
-                println!("ERROR");
-                process::exit(2);
-            }
+            // 평문은 바이너리 그대로 읽기
+            let plain = fs::read(in_path).unwrap_or_else(|_| { eprintln!("ERROR"); std::process::exit(2) });
+            let cipher = encrypt(&plain, aes_key, iv)
+                .unwrap_or_else(|_| { eprintln!("ERROR"); std::process::exit(2) });
+            let tag = hmac_tag(&key_hash, &cipher);
 
-            // Encrypt data
-            let cipher = Cipher::aes_256_cbc();
-            let encrypted = match encrypt_data(cipher, &real_key, &iv, &input_data) {
-                Ok(data) => data,
-                Err(_) => {
-                    println!("ERROR");
-                    process::exit(2);
-                }
-            };
+            // base64 인코딩 후 파일에 저장
+            let c_b64 = encode_block(&cipher);
+            let t_b64 = encode_block(&tag);
+            fs::write(out_path, c_b64).unwrap_or_else(|_| { eprintln!("ERROR"); std::process::exit(2) });
+            fs::write(tag_path, t_b64).unwrap_or_else(|_| { eprintln!("ERROR"); std::process::exit(2) });
 
-            // Combine IV and encrypted data
-            let mut final_data = iv.clone();
-            final_data.extend(&encrypted);
-
-            // Create HMAC
-            let mut mac = HmacSha256::new_from_slice(&real_key)
-                .expect("HMAC can take key of any size");
-            mac.update(&final_data);
-            let result = mac.finalize();
-            let tag = result.into_bytes();
-
-            // Write encrypted data and tag
-            if let Err(_) = fs::write(output_file, final_data) {
-                println!("ERROR");
-                process::exit(2);
-            }
-            if let Err(_) = fs::write(tag_file, tag) {
-                println!("ERROR");
-                process::exit(2);
-            }
+            std::process::exit(0);
         }
+
         "dec" => {
-            // Read tag file
-            let tag_data = match fs::read(tag_file) {
-                Ok(data) => data,
-                Err(_) => {
-                    println!("ERROR");
-                    process::exit(2);
-                }
-            };
+            // 암호문과 태그는 base64 텍스트이므로 문자열로 읽고 trim()
+            let c_b64 = fs::read_to_string(in_path).unwrap_or_else(|_| { eprintln!("ERROR"); std::process::exit(2) });
+            let cipher = decode_block(c_b64.trim())
+                .map_err(|_| ()).unwrap_or_else(|_| { eprintln!("ERROR"); std::process::exit(2) });
 
-            if input_data.len() < 16 {
-                println!("ERROR");
-                process::exit(2);
-            }
+            let t_b64 = fs::read_to_string(tag_path).unwrap_or_else(|_| { eprintln!("ERROR"); std::process::exit(2) });
+            let tag = decode_block(t_b64.trim())
+                .map_err(|_| ()).unwrap_or_else(|_| { eprintln!("ERROR"); std::process::exit(2) });
 
-            // Split IV and ciphertext
-            let (iv, encrypted) = input_data.split_at(16);
-
-            // Verify HMAC
-            let mut mac = HmacSha256::new_from_slice(&real_key)
-                .expect("HMAC can take key of any size");
-            mac.update(&input_data);
-            if let Err(_) = mac.verify_slice(&tag_data) {
+            // 인증
+            if !verify_tag(&key_hash, &cipher, &tag) {
                 println!("VERIFICATION FAILURE");
-                process::exit(1);
+                std::process::exit(1);
             }
 
-            // Decrypt data
-            let cipher = Cipher::aes_256_cbc();
-            let decrypted = match decrypt_data(cipher, &real_key, iv, encrypted) {
-                Ok(data) => data,
-                Err(_) => {
-                    println!("ERROR");
-                    process::exit(2);
-                }
-            };
+            // 복호화
+            let plain = decrypt(&cipher, aes_key, iv)
+                .unwrap_or_else(|_| { eprintln!("ERROR"); std::process::exit(2) });
+            fs::write(out_path, plain).unwrap_or_else(|_| { eprintln!("ERROR"); std::process::exit(2) });
 
-            // Write decrypted data
-            if let Err(_) = fs::write(output_file, decrypted) {
-                println!("ERROR");
-                process::exit(2);
-            }
+            std::process::exit(0);
         }
+
         _ => {
-            println!("ERROR");
-            process::exit(2);
+            eprintln!("ERROR");
+            std::process::exit(2);
         }
     }
-} 
+}
