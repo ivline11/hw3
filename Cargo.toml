@@ -1,0 +1,15 @@
+[package]
+name = "hw3"
+version = "1.0.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "cryp"
+
+[dependencies]
+hex-literal = "0.4.1"
+sha2 = "0.10.8"
+hmac = "0.12.1"
+openssl-sys = "0.9"
+openssl = "0.10"
